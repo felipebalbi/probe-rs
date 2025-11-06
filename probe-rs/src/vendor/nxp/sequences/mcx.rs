@@ -94,7 +94,7 @@ impl MCX {
     const VARIANT_A1: [&str; 6] = [
         "MCXA156", "MCXA155", "MCXA154", "MCXA146", "MCXA145", "MCXA144",
     ];
-    // const VARIANT_A2: [&str; 3] = ["MCXA16", "MCXA17", "MCXA27"];
+    const VARIANT_A2: [&str; 4] = ["MCXA16", "MCXA17", "MCXA25", "MCXA27"];
     const VARIANT_N: [&str; 1] = ["MCXN"];
     const VARIANT_N0: [&str; 1] = ["MCXN947"];
 
@@ -125,7 +125,7 @@ impl MCX {
     fn debug_mailbox_ap(&self, dp: DpAddress) -> Result<FullyQualifiedApAddress, ArmError> {
         if self.is_variant(Self::VARIANT_N) {
             Ok(FullyQualifiedApAddress::v1_with_dp(dp, 2))
-        } else if self.is_variant(Self::VARIANT_A) {
+        } else if self.is_variant(Self::VARIANT_A) || self.is_variant(Self::VARIANT_A2) {
             Ok(FullyQualifiedApAddress::v1_with_dp(dp, 1))
         } else {
             tracing::error!("unknown DebugMailbox AP");
