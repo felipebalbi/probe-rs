@@ -480,12 +480,15 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         let n_reset = n_reset.0 as u32;
 
         let can_read_pins = probe.swj_pins(n_reset, n_reset, 0)? != 0xffff_ffff;
+        tracing::debug!("reset deassert: pin readback {}", can_read_pins);
 
         if can_read_pins {
             let start = Instant::now();
 
             loop {
-                if Pins(probe.swj_pins(n_reset, n_reset, 0)? as u8).nreset() {
+                let pins = probe.swj_pins(n_reset, n_reset, 0)?;
+                tracing::debug!("reset deassert: pins {:#04x}", pins);
+                if Pins(pins as u8).nreset() {
                     return Ok(());
                 }
                 if start.elapsed() >= Duration::from_secs(1) {

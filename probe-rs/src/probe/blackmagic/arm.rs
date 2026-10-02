@@ -460,7 +460,7 @@ impl SwdSequence for BlackMagicProbeArmDebug {
                     ArmError::Probe(error) => error,
                     error => DebugProbeError::Other(error.to_string()),
                 })?;
-            Ok(pins.0 as u32)
+            Ok(pins.map_or(u32::MAX, |pins| u32::from(pins.0)))
         })
         .map_err(|error| match error {
             ArmError::Probe(error) => error,

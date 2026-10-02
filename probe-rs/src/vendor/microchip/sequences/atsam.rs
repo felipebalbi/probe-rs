@@ -262,7 +262,7 @@ impl SwdSequence for SwdSequenceShim<'_> {
                 Pins(pin_select as u8),
                 Duration::from_micros(pin_wait as u64),
             )
-            .map(|pins| pins.0 as u32)
+            .map(|pins| pins.map_or(u32::MAX, |pins| u32::from(pins.0)))
             .map_err(|error| match error {
                 ArmError::Probe(error) => error,
                 other => DebugProbeError::Other(other.to_string()),

@@ -12,13 +12,13 @@ use crate::{
         traits::DebugPortWire,
     },
     probe::{
-        BitSequence, DebugProbe, DebugProbeError, JtagChainAccess, Probe, SwdProbe, SwdSettings,
-        TapState, WireProtocol,
+        BitSequence, DebugProbe, DebugProbeError, JtagChainAccess, Probe, Results, SwdProbe,
+        SwdSettings, TapState, WireProtocol,
         jtag::dap::{
             jtag_output_sequence, jtag_read_block, jtag_read_register, jtag_write_block,
             jtag_write_register,
         },
-        swd::{Port, SwdBatch, SwdOp, SwdPort, SwdPortError, SwdTransferError},
+        swd::{Port, SwdBatch, SwdPort, SwdPortError, SwdTransferError},
     },
 };
 use jep106::JEP106Code;
@@ -223,11 +223,10 @@ impl SwdDebugPortWire<'_> {
         f(&mut port).map_err(ArmCommunicationInterface::swd_port_error)
     }
 
-    fn run_probe_batch(&mut self, batch: &SwdBatch) -> Result<(), ArmError> {
+    fn run_probe_batch(&mut self, batch: &SwdBatch) -> Result<Results, ArmError> {
         self.probe
             .run_batch(batch)
-            .map_err(|error| ArmError::Probe(batch_probe_error(error)))?;
-        Ok(())
+            .map_err(|error| ArmError::Probe(batch_probe_error(error)))
     }
 }
 
@@ -239,7 +238,8 @@ impl DebugPortWire for SwdDebugPortWire<'_> {
     fn swj_sequence(&mut self, bits: &BitSequence) -> Result<(), ArmError> {
         let mut batch = SwdBatch::new();
         batch.sequence(bits.clone());
-        self.run_probe_batch(&batch)
+        self.run_probe_batch(&batch)?;
+        Ok(())
     }
 
     fn jtag_sequence(&mut self, _tms: bool, _tdi: &BitSequence) -> Result<(), ArmError> {
@@ -258,12 +258,16 @@ impl DebugPortWire for SwdDebugPortWire<'_> {
         ))
     }
 
-    fn swj_pins(&mut self, out: Pins, select: Pins, wait: Duration) -> Result<Pins, ArmError> {
+    fn swj_pins(
+        &mut self,
+        out: Pins,
+        select: Pins,
+        wait: Duration,
+    ) -> Result<Option<Pins>, ArmError> {
         let mut batch = SwdBatch::new();
-        let _ = batch.schedule(SwdOp::Pins { out, select, wait });
-        self.run_probe_batch(&batch)?;
-        // The batch reports no levels; every pin high is what a released line reads.
-        Ok(Pins(0xFF))
+        let sample = batch.pins(out, select, wait);
+        let mut results = self.run_probe_batch(&batch)?;
+        Ok(results.take(sample).unwrap_or(None))
     }
 
     fn target_reset(&mut self) -> Result<(), ArmError> {
@@ -312,7 +316,7 @@ struct JtagDebugPortWire<'a> {
 
 impl JtagDebugPortWire<'_> {
     /// Try to run a batch of SWJ operations through SWD.
-    fn run_swj_batch(&mut self, batch: &SwdBatch) -> Result<(), ArmError> {
+    fn run_swj_batch(&mut self, batch: &SwdBatch) -> Result<Results, ArmError> {
         let Some(swd) = self.probe.try_as_swd_probe_mut() else {
             return Err(ArmError::Probe(
                 DebugProbeError::CommandNotSupportedByProbe {
@@ -321,8 +325,7 @@ impl JtagDebugPortWire<'_> {
             ));
         };
         swd.run_batch(batch)
-            .map_err(|error| ArmError::Probe(batch_probe_error(error)))?;
-        Ok(())
+            .map_err(|error| ArmError::Probe(batch_probe_error(error)))
     }
 }
 
@@ -353,12 +356,16 @@ impl DebugPortWire for JtagDebugPortWire<'_> {
             .map_err(ArmError::Probe)
     }
 
-    fn swj_pins(&mut self, out: Pins, select: Pins, wait: Duration) -> Result<Pins, ArmError> {
+    fn swj_pins(
+        &mut self,
+        out: Pins,
+        select: Pins,
+        wait: Duration,
+    ) -> Result<Option<Pins>, ArmError> {
         let mut batch = SwdBatch::new();
-        let _ = batch.schedule(SwdOp::Pins { out, select, wait });
-        self.run_swj_batch(&batch)?;
-        // The batch reports no levels; every pin high is what a released line reads.
-        Ok(Pins(0xFF))
+        let sample = batch.pins(out, select, wait);
+        let mut results = self.run_swj_batch(&batch)?;
+        Ok(results.take(sample).unwrap_or(None))
     }
 
     fn target_reset(&mut self) -> Result<(), ArmError> {
@@ -721,7 +728,10 @@ impl SwdSequence for ArmCommunicationInterface {
                 )
             })
             .map_err(wire_probe_error)?;
-        Ok(pins.0.into())
+        // `u32::MAX` is the documented "pin state not readable" sentinel that ARM debug
+        // sequences test for before polling nSRST. A real sample never collides with it
+        // because `Pins` is a byte.
+        Ok(pins.map_or(u32::MAX, |pins| u32::from(pins.0)))
     }
 }
 
@@ -1330,11 +1340,13 @@ mod tests {
     #[test]
     fn swj_pins_is_passed_to_the_swd_probe() {
         // The reset release of connect-under-reset drives nRESET through swj_pins.
-        let probe = MockSwdProbe::new();
+        let probe = MockSwdProbe::new().with_pin_sample(Pins(0));
         let pins = probe.shared_pins();
         let (mut interface, _) = swd_interface(probe);
         let nreset = 1 << 7;
-        assert_eq!(interface.swj_pins(nreset, nreset, 10).unwrap(), 0xFF);
+        // The sampled state is reported verbatim. nRESET reads low here, which is what a
+        // target still holding its reset line down looks like.
+        assert_eq!(interface.swj_pins(nreset, nreset, 10).unwrap(), 0);
         assert_eq!(
             *pins.lock().unwrap(),
             [RecordedPins {
@@ -1343,6 +1355,26 @@ mod tests {
                 wait: Duration::from_micros(10),
             }]
         );
+    }
+
+    #[test]
+    fn swj_pins_reports_the_sampled_pin_state() {
+        let probe = MockSwdProbe::new().with_pin_sample(Pins(0x80));
+        let (mut interface, _) = swd_interface(probe);
+        let nreset = 1 << 7;
+        assert_eq!(interface.swj_pins(nreset, nreset, 10).unwrap(), 0x80);
+    }
+
+    #[test]
+    fn swj_pins_reports_unreadable_pins_as_the_sentinel() {
+        // A probe that drives the pins but cannot sample them must not look like a target
+        // whose reset line has been released: ADIv5 debug sequences poll this value to
+        // decide whether nSRST is still asserted (IHI0031G B2.5), and fall back to a
+        // fixed delay when it is unavailable.
+        let probe = MockSwdProbe::new();
+        let (mut interface, _) = swd_interface(probe);
+        let nreset = 1 << 7;
+        assert_eq!(interface.swj_pins(nreset, nreset, 10).unwrap(), u32::MAX);
     }
 
     #[test]
@@ -1691,9 +1723,9 @@ mod tests {
             out: Pins,
             select: Pins,
             _wait: Duration,
-        ) -> Result<(), DebugProbeError> {
+        ) -> Result<Option<Pins>, DebugProbeError> {
             self.pins.lock().unwrap().push((out.0, select.0));
-            Ok(())
+            Ok(None)
         }
     }
 
@@ -1746,7 +1778,8 @@ mod tests {
             false,
         );
         let nreset = 1 << 7;
-        assert_eq!(interface.swj_pins(nreset, nreset, 10).unwrap(), 0xFF);
+        // TmsRecorder drives the pins without sampling them, so the sentinel is reported.
+        assert_eq!(interface.swj_pins(nreset, nreset, 10).unwrap(), u32::MAX);
         assert_eq!(*pins.lock().unwrap(), [(nreset as u8, nreset as u8)]);
         interface
             .swj_sequence(&BitSequence::repeat(true, 51))

@@ -1,0 +1,1 @@
+`swj_pins` now reports the pin state the probe actually sampled, and a dedicated sentinel when the probe cannot sample at all. Reset deassert no longer mistakes an unreadable probe for a target that has released its reset line.

@@ -196,6 +196,35 @@ impl SwdBatch {
     pub fn idle(&mut self, cycles: u32) {
         let _ = self.schedule(SwdOp::Idle { cycles });
     }
+
+    /// Schedule an SWJ pin drive and return a handle for the sampled pin state.
+    ///
+    /// The handle yields `None` when the probe cannot report the pin input state.
+    pub fn pins(&mut self, out: Pins, select: Pins, wait: Duration) -> Handle<Option<Pins>> {
+        self.schedule(SwdOp::Pins { out, select, wait })
+            .map(decode_pin_sample)
+    }
+}
+
+/// Carries an optional pin sample through [`CommandResult`].
+///
+/// `Pins` is a `u8`, so it has no spare encoding for "not sampled". The batch result uses
+/// [`u32::MAX`] for that case, matching the sentinel that [`SwdSequence::swj_pins`] already
+/// documents to its callers.
+///
+/// [`SwdSequence::swj_pins`]: crate::architecture::arm::communication_interface::SwdSequence::swj_pins
+const PIN_SAMPLE_UNAVAILABLE: u32 = u32::MAX;
+
+fn encode_pin_sample(pins: Option<Pins>) -> CommandResult {
+    CommandResult::U32(pins.map_or(PIN_SAMPLE_UNAVAILABLE, |pins| u32::from(pins.0)))
+}
+
+fn decode_pin_sample(result: CommandResult) -> Option<Pins> {
+    match result {
+        CommandResult::U32(PIN_SAMPLE_UNAVAILABLE) => None,
+        CommandResult::U32(value) => Some(Pins(value as u8)),
+        _ => panic!("unexpected CommandResult variant for an SWJ pin sample"),
+    }
 }
 
 /// An error response from an SWD transfer.
@@ -342,13 +371,17 @@ pub trait BitbangSwd: DebugProbe {
     /// Returns the SWD wire-protocol timing settings used by this probe.
     fn swd_settings(&self) -> &SwdSettings;
 
-    /// Drive CMSIS-DAP SWJ pins.
+    /// Drive CMSIS-DAP SWJ pins and sample them back.
+    ///
+    /// Returns `None` when the probe drives the pins but cannot report their input state.
+    /// Callers must not treat that as "every pin is high": ADIv5 debug sequences that poll
+    /// for nSRST release depend on telling a real sample apart from an unavailable one.
     fn swj_pins_op(
         &mut self,
         _out: Pins,
         _select: Pins,
         _wait: Duration,
-    ) -> Result<(), DebugProbeError> {
+    ) -> Result<Option<Pins>, DebugProbeError> {
         Err(DebugProbeError::CommandNotSupportedByProbe {
             command_name: "swj_pins",
         })
@@ -498,10 +531,13 @@ fn run_bitbang_batch<P: BitbangSwd>(
             }
             SwdOp::Pins { out, select, wait } => {
                 run.flush(probe, &mut results)?;
-                if let Err(error) = probe.swj_pins_op(*out, *select, *wait) {
-                    return Err(BatchExecutionError::new_from_debug_probe_at(
-                        error, results, operation,
-                    ));
+                match probe.swj_pins_op(*out, *select, *wait) {
+                    Ok(pins) => results.push(id, encode_pin_sample(pins)),
+                    Err(error) => {
+                        return Err(BatchExecutionError::new_from_debug_probe_at(
+                            error, results, operation,
+                        ));
+                    }
                 }
             }
         }

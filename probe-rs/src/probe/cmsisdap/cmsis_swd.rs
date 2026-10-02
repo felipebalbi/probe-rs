@@ -563,7 +563,7 @@ impl CmsisDap {
         out: SwdPins,
         select: SwdPins,
         wait: Duration,
-    ) -> Result<(), DebugProbeError> {
+    ) -> Result<SwdPins, DebugProbeError> {
         self.connect_if_needed()?;
 
         let request = commands::swj::pins::SWJPinsRequest::from_raw_values(
@@ -571,8 +571,9 @@ impl CmsisDap {
             select.0,
             wait.as_micros() as u32,
         );
-        commands::send_command(&mut self.device, &request)?;
-        Ok(())
+        // DAP_SWJ_Pins responds with the pin input state sampled after the wait; see
+        // `SWJPinsRequest::parse_response`.
+        Ok(commands::send_command(&mut self.device, &request)?)
     }
 }
 
@@ -603,7 +604,7 @@ impl SwdProbe for CmsisDap {
             }
 
             // Whatever ended the run is handled on its own, and cannot share a packet.
-            let Some((_, op)) = ops.get(batch_index) else {
+            let Some((id, op)) = ops.get(batch_index) else {
                 break;
             };
 
@@ -637,12 +638,15 @@ impl SwdProbe for CmsisDap {
                     }
                 }
                 SwdOp::Pins { out, select, wait } => {
-                    if let Err(error) = self.run_swj_pins_op(*out, *select, *wait) {
-                        return Err(BatchExecutionError::new_from_debug_probe_at(
-                            error,
-                            results,
-                            batch_index,
-                        ));
+                    match self.run_swj_pins_op(*out, *select, *wait) {
+                        Ok(pins) => results.push(id, CommandResult::U32(u32::from(pins.0))),
+                        Err(error) => {
+                            return Err(BatchExecutionError::new_from_debug_probe_at(
+                                error,
+                                results,
+                                batch_index,
+                            ));
+                        }
                     }
                 }
             }

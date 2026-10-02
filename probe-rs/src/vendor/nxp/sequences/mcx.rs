@@ -562,6 +562,7 @@ impl ArmDebugSequence for MCX {
         let n_reset = Pins(0x80).0 as u32;
 
         let can_read_pins = probe.swj_pins(n_reset, n_reset, 0)? != 0xFFFF_FFFF;
+        tracing::debug!("mcx reset deassert: pin readback {}", can_read_pins);
 
         let reset_duration = if self.is_variant(Self::VARIANT_N0) {
             Duration::from_millis(100)
@@ -575,7 +576,13 @@ impl ArmDebugSequence for MCX {
             let start = Instant::now();
             let timeout_occurred = || start.elapsed() > Duration::from_millis(1000);
 
-            while assert_n_reset()? & n_reset == 0 && !timeout_occurred() {}
+            loop {
+                let pins = assert_n_reset()?;
+                tracing::debug!("mcx reset deassert: pins {:#04x}", pins);
+                if pins & n_reset != 0 || timeout_occurred() {
+                    break;
+                }
+            }
         } else {
             assert_n_reset()?;
             let recovery_time = if self.is_variant(Self::VARIANT_N0) {
