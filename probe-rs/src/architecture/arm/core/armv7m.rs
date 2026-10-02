@@ -642,6 +642,33 @@ pub struct Armv7m<'probe> {
 }
 
 impl<'probe> Armv7m<'probe> {
+    /// Clear DHCSR.C_HALT so the core resumes from the current program counter.
+    fn resume(&mut self) -> Result<(), Error> {
+        let mut dhcsr = Dhcsr(self.memory.read_word_32(Dhcsr::get_mmio_address())?);
+
+        // First disable the DHCSR->C_MASKINTS.
+        if dhcsr.c_maskints() {
+            dhcsr.set_c_maskints(false);
+            dhcsr.enable_write();
+            self.memory
+                .write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
+            self.memory.flush()?;
+        }
+
+        // Exit halt state ..
+        dhcsr.set_c_step(false);
+        dhcsr.set_c_halt(false);
+        dhcsr.enable_write();
+        self.memory
+            .write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
+        self.memory.flush()?;
+
+        // We assume that the core is running now
+        self.set_core_status(CoreStatus::Running);
+
+        Ok(())
+    }
+
     pub(crate) fn new(
         mut memory: Box<dyn ArmMemoryInterface + 'probe>,
         state: &'probe mut CortexMState,
@@ -826,30 +853,14 @@ impl CoreInterface for Armv7m<'_> {
         // Before we run, we always perform a single instruction step, to account for possible breakpoints that might get us stuck on the current instruction.
         self.step()?;
         self.state.clear_pending_step();
+        self.resume()
+    }
 
-        let mut dhcsr = Dhcsr(self.memory.read_word_32(Dhcsr::get_mmio_address())?);
-
-        // First disable the DHCSR->C_MASKINTS.
-        if dhcsr.c_maskints() {
-            dhcsr.set_c_maskints(false);
-            dhcsr.enable_write();
-            self.memory
-                .write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
-            self.memory.flush()?;
-        }
-
-        // Exit halt state ..
-        dhcsr.set_c_step(false);
-        dhcsr.set_c_halt(false);
-        dhcsr.enable_write();
-        self.memory
-            .write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
-        self.memory.flush()?;
-
-        // We assume that the core is running now
-        self.set_core_status(CoreStatus::Running);
-
-        Ok(())
+    fn run_from_written_pc(&mut self) -> Result<(), Error> {
+        // The caller moved the program counter, so there is no breakpoint on the current
+        // instruction left to step over.
+        self.state.clear_pending_step();
+        self.resume()
     }
 
     fn reset(&mut self) -> Result<(), Error> {

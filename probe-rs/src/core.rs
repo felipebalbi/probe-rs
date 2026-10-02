@@ -54,6 +54,20 @@ pub trait CoreInterface: MemoryInterface {
     /// Continue to execute instructions.
     fn run(&mut self) -> Result<(), Error>;
 
+    /// Continue to execute instructions, when the caller has already moved the program counter
+    /// since the core halted.
+    ///
+    /// [`run`](Self::run) single-steps first, so that a core halted on a breakpoint makes
+    /// progress instead of re-reporting the same breakpoint. A caller that has written a new
+    /// program counter has already left that instruction, so the step is unnecessary work. On a
+    /// slow debug link it is not cheap: it is several more round trips per resume.
+    ///
+    /// The default implementation is [`run`](Self::run), so an architecture that has no cheaper
+    /// path is still correct.
+    fn run_from_written_pc(&mut self) -> Result<(), Error> {
+        self.run()
+    }
+
     /// Reset the core, and then continue to execute instructions. If the core
     /// should be halted after reset, use the [`reset_and_halt`] function.
     ///
@@ -279,6 +293,15 @@ impl<'probe> Core<'probe> {
     #[tracing::instrument(skip(self))]
     pub fn run(&mut self) -> Result<(), Error> {
         self.inner.run()
+    }
+
+    /// Continue to execute instructions, when the caller has already moved the program counter
+    /// since the core halted.
+    ///
+    /// See [`CoreInterface::run_from_written_pc`].
+    #[tracing::instrument(skip(self))]
+    pub fn run_from_written_pc(&mut self) -> Result<(), Error> {
+        self.inner.run_from_written_pc()
     }
 
     /// Reset the core, and then continue to execute instructions. If the core
