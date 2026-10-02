@@ -1,0 +1,1 @@
+Flash verification can now be performed by a target-computed signature where the hardware offers one, instead of reading the whole image back. `FlashVerify` is the opt-in interface for vendors. NXP MCX A17x/A18x/A25x/A26x use the flash module's MISR, which makes verification after a download roughly free.
