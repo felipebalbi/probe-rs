@@ -1,0 +1,1 @@
+A debug sequence that resets the target no longer leaves the debug link dead. probe-rs now resynchronizes the wire and retries, so an NXP MCX part held in ISP mode can be attached to and flashed on the first attempt.
