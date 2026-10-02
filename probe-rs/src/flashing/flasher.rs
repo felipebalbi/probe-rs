@@ -1036,8 +1036,9 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
             }
         }
 
-        // Resume target operation.
-        self.core.run().map_err(FlashError::Run)?;
+        // Resume target operation. The program counter was written above, so the core is no
+        // longer on the instruction it halted at and there is no breakpoint to step over.
+        self.core.run_from_written_pc().map_err(FlashError::Run)?;
 
         if let Some(rtt_address) = self.flash_algorithm.rtt_control_block
             && self.rtt.is_none()
