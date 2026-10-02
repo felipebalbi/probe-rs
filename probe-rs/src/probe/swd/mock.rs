@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::probe::SwdSettings;
 
-use super::{Direction, Port, SwdBatch, SwdOp, SwdProbe, SwdTransferError};
+use super::{Direction, Pins, Port, SwdBatch, SwdOp, SwdProbe, SwdTransferError};
 use crate::probe::{
     BatchError, BatchExecutionError, BitSequence, CommandResult, DebugProbe, DebugProbeError,
     Results, WireProtocol,
@@ -67,6 +67,7 @@ pub(crate) struct MockSwdProbe {
     capture_flags: Arc<Mutex<Vec<bool>>>,
     idles: Arc<Mutex<Vec<u32>>>,
     pins: Arc<Mutex<Vec<RecordedPins>>>,
+    pin_sample: Option<Pins>,
     swd_settings: SwdSettings,
 }
 
@@ -85,8 +86,17 @@ impl MockSwdProbe {
             capture_flags: Arc::new(Mutex::new(Vec::new())),
             idles: Arc::new(Mutex::new(Vec::new())),
             pins: Arc::new(Mutex::new(Vec::new())),
+            pin_sample: None,
             swd_settings: SwdSettings::default(),
         }
+    }
+
+    /// Make the mock report `sample` as the SWJ pin input state.
+    ///
+    /// Left unset, the mock behaves like a probe that drives the pins without sampling them.
+    pub(crate) fn with_pin_sample(mut self, sample: Pins) -> Self {
+        self.pin_sample = Some(sample);
+        self
     }
 
     /// Return a handle to the recorded operations.
@@ -304,6 +314,7 @@ impl SwdProbe for MockSwdProbe {
                         select: select.0,
                         wait: *wait,
                     });
+                    results.push(id, super::encode_pin_sample(self.pin_sample));
                 }
             }
         }

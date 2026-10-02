@@ -1434,7 +1434,7 @@ impl BitbangSwd for BlackMagicProbe {
         out: Pins,
         select: Pins,
         _wait: Duration,
-    ) -> Result<(), DebugProbeError> {
+    ) -> Result<Option<Pins>, DebugProbeError> {
         let pin_out = out.0 as u32;
         let pin_select = select.0 as u32;
 
@@ -1446,7 +1446,8 @@ impl BitbangSwd for BlackMagicProbe {
         if pin_select & 0x80 != 0 {
             self.command(RemoteCommand::TargetReset(pin_out & 0x80 == 0))?;
         }
-        Ok(())
+        // The Black Magic remote protocol drives nRST but reports no pin input state.
+        Ok(None)
     }
 
     fn swd_settings(&self) -> &SwdSettings {

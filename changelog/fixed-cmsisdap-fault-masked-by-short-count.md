@@ -1,0 +1,1 @@
+A CMSIS-DAP transfer that faults part way through a batch is now reported as a fault and recovered from, instead of being reported as an unexplained short transfer count that left the sticky error set and wedged the session.

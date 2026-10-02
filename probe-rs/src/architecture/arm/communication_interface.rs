@@ -12,13 +12,13 @@ use crate::{
         traits::DebugPortWire,
     },
     probe::{
-        BitSequence, DebugProbe, DebugProbeError, JtagChainAccess, Probe, SwdProbe, SwdSettings,
-        TapState, WireProtocol,
+        BitSequence, DebugProbe, DebugProbeError, JtagChainAccess, Probe, Results, SwdProbe,
+        SwdSettings, TapState, WireProtocol,
         jtag::dap::{
             jtag_output_sequence, jtag_read_block, jtag_read_register, jtag_write_block,
             jtag_write_register,
         },
-        swd::{Port, SwdBatch, SwdOp, SwdPort, SwdPortError, SwdTransferError},
+        swd::{Port, SwdBatch, SwdPort, SwdPortError, SwdTransferError},
     },
 };
 use jep106::JEP106Code;
@@ -181,6 +181,12 @@ pub(crate) struct DpState {
     pub debug_port_version: DebugPortVersion,
 
     pub(crate) current_select: SelectCache,
+
+    /// Whether `current_select` is known to describe the debug port's actual selection.
+    ///
+    /// Cleared when a SELECT write fails, because the selection is then genuinely unknown
+    /// and the cached value must not be used to skip the next write.
+    pub(crate) select_valid: bool,
 }
 
 impl DpState {
@@ -188,6 +194,7 @@ impl DpState {
         Self {
             debug_port_version: DebugPortVersion::Unsupported(0xFF),
             current_select: SelectCache::DPv1(SelectV1(0)),
+            select_valid: false,
         }
     }
 }
@@ -223,11 +230,10 @@ impl SwdDebugPortWire<'_> {
         f(&mut port).map_err(ArmCommunicationInterface::swd_port_error)
     }
 
-    fn run_probe_batch(&mut self, batch: &SwdBatch) -> Result<(), ArmError> {
+    fn run_probe_batch(&mut self, batch: &SwdBatch) -> Result<Results, ArmError> {
         self.probe
             .run_batch(batch)
-            .map_err(|error| ArmError::Probe(batch_probe_error(error)))?;
-        Ok(())
+            .map_err(|error| ArmError::Probe(batch_probe_error(error)))
     }
 }
 
@@ -239,7 +245,8 @@ impl DebugPortWire for SwdDebugPortWire<'_> {
     fn swj_sequence(&mut self, bits: &BitSequence) -> Result<(), ArmError> {
         let mut batch = SwdBatch::new();
         batch.sequence(bits.clone());
-        self.run_probe_batch(&batch)
+        self.run_probe_batch(&batch)?;
+        Ok(())
     }
 
     fn jtag_sequence(&mut self, _tms: bool, _tdi: &BitSequence) -> Result<(), ArmError> {
@@ -258,12 +265,16 @@ impl DebugPortWire for SwdDebugPortWire<'_> {
         ))
     }
 
-    fn swj_pins(&mut self, out: Pins, select: Pins, wait: Duration) -> Result<Pins, ArmError> {
+    fn swj_pins(
+        &mut self,
+        out: Pins,
+        select: Pins,
+        wait: Duration,
+    ) -> Result<Option<Pins>, ArmError> {
         let mut batch = SwdBatch::new();
-        let _ = batch.schedule(SwdOp::Pins { out, select, wait });
-        self.run_probe_batch(&batch)?;
-        // The batch reports no levels; every pin high is what a released line reads.
-        Ok(Pins(0xFF))
+        let sample = batch.pins(out, select, wait);
+        let mut results = self.run_probe_batch(&batch)?;
+        Ok(results.take(sample).unwrap_or(None))
     }
 
     fn target_reset(&mut self) -> Result<(), ArmError> {
@@ -312,7 +323,7 @@ struct JtagDebugPortWire<'a> {
 
 impl JtagDebugPortWire<'_> {
     /// Try to run a batch of SWJ operations through SWD.
-    fn run_swj_batch(&mut self, batch: &SwdBatch) -> Result<(), ArmError> {
+    fn run_swj_batch(&mut self, batch: &SwdBatch) -> Result<Results, ArmError> {
         let Some(swd) = self.probe.try_as_swd_probe_mut() else {
             return Err(ArmError::Probe(
                 DebugProbeError::CommandNotSupportedByProbe {
@@ -321,8 +332,7 @@ impl JtagDebugPortWire<'_> {
             ));
         };
         swd.run_batch(batch)
-            .map_err(|error| ArmError::Probe(batch_probe_error(error)))?;
-        Ok(())
+            .map_err(|error| ArmError::Probe(batch_probe_error(error)))
     }
 }
 
@@ -353,12 +363,16 @@ impl DebugPortWire for JtagDebugPortWire<'_> {
             .map_err(ArmError::Probe)
     }
 
-    fn swj_pins(&mut self, out: Pins, select: Pins, wait: Duration) -> Result<Pins, ArmError> {
+    fn swj_pins(
+        &mut self,
+        out: Pins,
+        select: Pins,
+        wait: Duration,
+    ) -> Result<Option<Pins>, ArmError> {
         let mut batch = SwdBatch::new();
-        let _ = batch.schedule(SwdOp::Pins { out, select, wait });
-        self.run_swj_batch(&batch)?;
-        // The batch reports no levels; every pin high is what a released line reads.
-        Ok(Pins(0xFF))
+        let sample = batch.pins(out, select, wait);
+        let mut results = self.run_swj_batch(&batch)?;
+        Ok(results.take(sample).unwrap_or(None))
     }
 
     fn target_reset(&mut self) -> Result<(), ArmError> {
@@ -545,6 +559,57 @@ impl ArmCommunicationInterface {
         }
     }
 
+    /// Whether an error means the target stopped answering, rather than answering with a fault.
+    ///
+    /// A target that resets mid-session drops off the wire like this. The debug mailbox of the
+    /// NXP MCX parts resets the chip on purpose, so this is a normal step of attaching to one
+    /// held in ISP mode, not only a sign of broken wiring.
+    fn is_link_lost(error: &ArmError) -> bool {
+        matches!(
+            error,
+            ArmError::Dap(DapError::NoAcknowledge) | ArmError::Dap(DapError::Protocol(_))
+        )
+    }
+
+    /// Resynchronize the wire after the target stopped answering, then retry `op` once.
+    ///
+    /// ADIv5 (IHI0031G B4.2.5) says that a host which does not receive an expected response
+    /// must stop driving the line and attempt a line reset; that is what `debug_port_connect`
+    /// does. Without it a target that resets during a debug sequence never comes back, because
+    /// every later transfer is issued into a link that is still out of step.
+    fn retry_after_link_loss<T>(
+        &mut self,
+        dp: DpAddress,
+        mut op: impl FnMut(&mut Self) -> Result<T, ArmError>,
+    ) -> Result<T, ArmError> {
+        let first = op(self);
+        let Err(error) = first else {
+            return first;
+        };
+        if !Self::is_link_lost(&error) {
+            return Err(error);
+        }
+
+        tracing::debug!("target stopped answering ({error}), resynchronizing the wire");
+        let sequence = self.sequence.clone();
+        self.with_debug_port_wire(|wire| {
+            // The line is already out of step, so a failure to flush it says nothing new.
+            let _ = wire.raw_flush();
+            sequence.debug_port_connect(wire, dp)
+        })
+        .map_err(|reconnect| {
+            tracing::debug!("resynchronizing failed: {reconnect}");
+            error
+        })?;
+
+        // The reset took the selection with it.
+        if let Some(state) = self.dps.get_mut(&dp) {
+            state.select_valid = false;
+        }
+
+        op(self)
+    }
+
     fn swd_transfer_to_dap(error: SwdTransferError) -> DapError {
         match error {
             SwdTransferError::NoAcknowledge => DapError::NoAcknowledge,
@@ -721,7 +786,10 @@ impl SwdSequence for ArmCommunicationInterface {
                 )
             })
             .map_err(wire_probe_error)?;
-        Ok(pins.0.into())
+        // `u32::MAX` is the documented "pin state not readable" sentinel that ARM debug
+        // sequences test for before polling nSRST. A real sample never collides with it
+        // because `Pins` is a byte.
+        Ok(pins.map_or(u32::MAX, |pins| u32::from(pins.0)))
     }
 }
 
@@ -877,7 +945,7 @@ impl ArmCommunicationInterface {
 
         let bank = bank.unwrap_or(0);
 
-        if bank != dp_state.current_select.dp_bank_sel() {
+        if !dp_state.select_valid || bank != dp_state.current_select.dp_bank_sel() {
             dp_state.current_select.set_dp_bank_sel(bank);
 
             tracing::debug!("Changing DP_BANK_SEL to {:x?}", dp_state.current_select);
@@ -891,6 +959,48 @@ impl ArmCommunicationInterface {
         Ok(())
     }
 
+    /// Fold a direct SELECT/SELECT1 write into the cached selection.
+    ///
+    /// SELECT holds the current AP and the active register banks (IHI0031G B2.2.9). The cache
+    /// exists to skip redundant SELECT writes, so anything writing SELECT without going
+    /// through [`Self::select_ap_and_ap_bank`] has to be folded in, or the cache keeps
+    /// describing a selection the debug port no longer has. Debug sequences do exactly that:
+    /// the MCX sequence opens with SELECT=0.
+    ///
+    /// A failed write leaves the selection genuinely unknown, so the cache is marked invalid
+    /// and the next access writes SELECT again rather than trusting a value that may never
+    /// have reached the target.
+    fn sync_select_cache(
+        &mut self,
+        dp: DpAddress,
+        address: DpRegisterAddress,
+        value: u32,
+        wrote: bool,
+    ) {
+        let is_select = address.address == 0x8 && address.bank.unwrap_or(0) == 0;
+        let is_select1 = address.address == 0x4 && address.bank == Some(0x5);
+        if !is_select && !is_select1 {
+            return;
+        }
+
+        let Some(state) = self.dps.get_mut(&dp) else {
+            return;
+        };
+
+        if !wrote {
+            state.select_valid = false;
+            return;
+        }
+
+        state.current_select = match (state.current_select, is_select) {
+            (SelectCache::DPv1(_), true) => SelectCache::DPv1(SelectV1(value)),
+            (SelectCache::DPv3(_, s1), true) => SelectCache::DPv3(SelectV3(value), s1),
+            (SelectCache::DPv3(s, _), false) => SelectCache::DPv3(s, Select1(value)),
+            (current, false) => current,
+        };
+        state.select_valid = true;
+    }
+
     fn select_ap_and_ap_bank(
         &mut self,
         ap: &FullyQualifiedApAddress,
@@ -899,6 +1009,7 @@ impl ArmCommunicationInterface {
         let dp_state = self.select_dp(ap.dp())?;
 
         let previous_select = dp_state.current_select;
+        let was_valid = dp_state.select_valid;
         match (ap.ap(), &mut dp_state.current_select) {
             (ApAddress::V1(port), SelectCache::DPv1(s)) => {
                 let ap_register_address = (ap_register_address & 0xFF) as u8;
@@ -934,7 +1045,7 @@ impl ArmCommunicationInterface {
             }
         }
 
-        if previous_select != dp_state.current_select {
+        if !was_valid || previous_select != dp_state.current_select {
             tracing::debug!("Changing SELECT to {:x?}", dp_state.current_select);
 
             match dp_state.current_select {
@@ -1024,7 +1135,7 @@ impl DapAccess for ArmCommunicationInterface {
     ) -> Result<(), ArmError> {
         self.select_dp_and_dp_bank(dp, &address)?;
         let register = RegisterAddress::DpRegister(address);
-        if self.is_swd() {
+        let result = if self.is_swd() {
             let addr = Self::swd_addr(register);
             self.with_swd_port(|port| {
                 let mut batch = SwdBatch::new();
@@ -1036,7 +1147,11 @@ impl DapAccess for ArmCommunicationInterface {
             self.with_jtag_chain(|chain, settings| {
                 jtag_write_register(chain, register, value, settings)
             })
-        }
+        };
+
+        self.sync_select_cache(dp, address, value, result.is_ok());
+
+        result
     }
 
     fn read_raw_ap_register(
@@ -1044,20 +1159,24 @@ impl DapAccess for ArmCommunicationInterface {
         ap: &FullyQualifiedApAddress,
         address: u64,
     ) -> Result<u32, ArmError> {
-        self.select_ap_and_ap_bank(ap, address)?;
-        let register = RegisterAddress::ApRegister((address & 0xFF) as u8);
+        self.retry_after_link_loss(ap.dp(), |this| {
+            this.select_ap_and_ap_bank(ap, address)?;
+            let register = RegisterAddress::ApRegister((address & 0xFF) as u8);
 
-        if self.is_swd() {
-            let addr = Self::ap_swd_addr(address);
-            self.with_swd_port(|port| {
-                let mut batch = SwdBatch::new();
-                let handle = port.read_ap_block(&mut batch, addr, 1);
-                let mut results = port.run(batch)?;
-                Ok(results.take(handle).unwrap()[0])
-            })
-        } else {
-            self.with_jtag_chain(|chain, settings| jtag_read_register(chain, register, settings))
-        }
+            if this.is_swd() {
+                let addr = Self::ap_swd_addr(address);
+                this.with_swd_port(|port| {
+                    let mut batch = SwdBatch::new();
+                    let handle = port.read_ap_block(&mut batch, addr, 1);
+                    let mut results = port.run(batch)?;
+                    Ok(results.take(handle).unwrap()[0])
+                })
+            } else {
+                this.with_jtag_chain(|chain, settings| {
+                    jtag_read_register(chain, register, settings)
+                })
+            }
+        })
     }
 
     fn read_raw_ap_register_repeated(
@@ -1169,22 +1288,24 @@ impl DapAccess for ArmCommunicationInterface {
         address: u64,
         value: u32,
     ) -> Result<(), ArmError> {
-        self.select_ap_and_ap_bank(ap, address)?;
-        let register = RegisterAddress::ApRegister((address & 0xFF) as u8);
+        self.retry_after_link_loss(ap.dp(), |this| {
+            this.select_ap_and_ap_bank(ap, address)?;
+            let register = RegisterAddress::ApRegister((address & 0xFF) as u8);
 
-        if self.is_swd() {
-            let addr = Self::ap_swd_addr(address);
-            self.with_swd_port(|port| {
-                let mut batch = SwdBatch::new();
-                batch.write(Port::Ap, addr, value);
-                port.run(batch)?;
-                Ok(())
-            })
-        } else {
-            self.with_jtag_chain(|chain, settings| {
-                jtag_write_register(chain, register, value, settings)
-            })
-        }
+            if this.is_swd() {
+                let addr = Self::ap_swd_addr(address);
+                this.with_swd_port(|port| {
+                    let mut batch = SwdBatch::new();
+                    batch.write(Port::Ap, addr, value);
+                    port.run(batch)?;
+                    Ok(())
+                })
+            } else {
+                this.with_jtag_chain(|chain, settings| {
+                    jtag_write_register(chain, register, value, settings)
+                })
+            }
+        })
     }
 
     fn write_raw_ap_register_repeated(
@@ -1330,11 +1451,13 @@ mod tests {
     #[test]
     fn swj_pins_is_passed_to_the_swd_probe() {
         // The reset release of connect-under-reset drives nRESET through swj_pins.
-        let probe = MockSwdProbe::new();
+        let probe = MockSwdProbe::new().with_pin_sample(Pins(0));
         let pins = probe.shared_pins();
         let (mut interface, _) = swd_interface(probe);
         let nreset = 1 << 7;
-        assert_eq!(interface.swj_pins(nreset, nreset, 10).unwrap(), 0xFF);
+        // The sampled state is reported verbatim. nRESET reads low here, which is what a
+        // target still holding its reset line down looks like.
+        assert_eq!(interface.swj_pins(nreset, nreset, 10).unwrap(), 0);
         assert_eq!(
             *pins.lock().unwrap(),
             [RecordedPins {
@@ -1343,6 +1466,26 @@ mod tests {
                 wait: Duration::from_micros(10),
             }]
         );
+    }
+
+    #[test]
+    fn swj_pins_reports_the_sampled_pin_state() {
+        let probe = MockSwdProbe::new().with_pin_sample(Pins(0x80));
+        let (mut interface, _) = swd_interface(probe);
+        let nreset = 1 << 7;
+        assert_eq!(interface.swj_pins(nreset, nreset, 10).unwrap(), 0x80);
+    }
+
+    #[test]
+    fn swj_pins_reports_unreadable_pins_as_the_sentinel() {
+        // A probe that drives the pins but cannot sample them must not look like a target
+        // whose reset line has been released: ADIv5 debug sequences poll this value to
+        // decide whether nSRST is still asserted (IHI0031G B2.5), and fall back to a
+        // fixed delay when it is unavailable.
+        let probe = MockSwdProbe::new();
+        let (mut interface, _) = swd_interface(probe);
+        let nreset = 1 << 7;
+        assert_eq!(interface.swj_pins(nreset, nreset, 10).unwrap(), u32::MAX);
     }
 
     #[test]
@@ -1501,6 +1644,47 @@ mod tests {
             16
         );
         assert_eq!(read_ops(&ops).last(), Some(&(Port::Dp, DP_RDBUFF_ADDR)));
+    }
+
+    #[test]
+    fn swd_direct_select_write_invalidates_the_cached_selection() {
+        // SELECT holds APSEL and the active register banks (IHI0031G B2.2.9). Debug sequences
+        // write it directly - the MCX sequence opens with SELECT=0 - so the cache has to
+        // follow. Otherwise the next access to the previously selected AP skips its SELECT
+        // write and the transfer lands on whichever AP the direct write left selected.
+        let mut probe = MockSwdProbe::new();
+        prepare_swd_probe(&mut probe);
+        probe.set_read_value(Port::Dp, DP_RDBUFF_ADDR, 42);
+        let (mut interface, operations) = swd_interface(probe);
+        finish_attach(&mut interface, &operations);
+
+        let ap1 = FullyQualifiedApAddress::v1_with_default_dp(1);
+        interface
+            .read_raw_ap_register(&ap1, 0x0C)
+            .expect("read should succeed");
+
+        interface
+            .write_raw_dp_register(
+                DpAddress::Default,
+                DpRegisterAddress {
+                    address: DP_SELECT_ADDR,
+                    bank: None,
+                },
+                0,
+            )
+            .expect("write should succeed");
+
+        operations.lock().unwrap().clear();
+        interface
+            .read_raw_ap_register(&ap1, 0x0C)
+            .expect("read should succeed");
+
+        let ops = operations.lock().unwrap();
+        assert_eq!(
+            write_ops(&ops),
+            vec![(Port::Dp, DP_SELECT_ADDR, 1 << 24)],
+            "AP1 must be reselected after a direct SELECT write"
+        );
     }
 
     type SwdTestInterface = (
@@ -1691,9 +1875,9 @@ mod tests {
             out: Pins,
             select: Pins,
             _wait: Duration,
-        ) -> Result<(), DebugProbeError> {
+        ) -> Result<Option<Pins>, DebugProbeError> {
             self.pins.lock().unwrap().push((out.0, select.0));
-            Ok(())
+            Ok(None)
         }
     }
 
@@ -1746,7 +1930,8 @@ mod tests {
             false,
         );
         let nreset = 1 << 7;
-        assert_eq!(interface.swj_pins(nreset, nreset, 10).unwrap(), 0xFF);
+        // TmsRecorder drives the pins without sampling them, so the sentinel is reported.
+        assert_eq!(interface.swj_pins(nreset, nreset, 10).unwrap(), u32::MAX);
         assert_eq!(*pins.lock().unwrap(), [(nreset as u8, nreset as u8)]);
         interface
             .swj_sequence(&BitSequence::repeat(true, 51))

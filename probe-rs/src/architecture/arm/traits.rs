@@ -361,7 +361,15 @@ pub trait DebugPortWire {
     fn configure_jtag(&mut self, skip_scan: bool) -> Result<(), ArmError>;
 
     /// Drive SWJ pins and return the pin input state when supported.
-    fn swj_pins(&mut self, out: Pins, select: Pins, wait: Duration) -> Result<Pins, ArmError>;
+    ///
+    /// Returns `None` when the probe drives the pins but cannot sample them, so that callers
+    /// can tell an unavailable sample apart from one that reads every pin high.
+    fn swj_pins(
+        &mut self,
+        out: Pins,
+        select: Pins,
+        wait: Duration,
+    ) -> Result<Option<Pins>, ArmError>;
 
     /// Pulse the target reset line.
     fn target_reset(&mut self) -> Result<(), ArmError>;

@@ -1229,7 +1229,7 @@ impl BitbangSwd for JLink {
         out: Pins,
         select: Pins,
         wait: Duration,
-    ) -> Result<(), DebugProbeError> {
+    ) -> Result<Option<Pins>, DebugProbeError> {
         if select.ntrst() || select.tdi() || select.tdo() {
             Err(DebugProbeError::CommandNotSupportedByProbe {
                 command_name: "swj_pins",
@@ -1252,7 +1252,8 @@ impl BitbangSwd for JLink {
             }
 
             std::thread::sleep(wait);
-            Ok(())
+            // The J-Link driver drives these pins but does not sample them back.
+            Ok(None)
         }
     }
 
