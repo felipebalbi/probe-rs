@@ -81,12 +81,20 @@ impl CombinedCoreState {
 
         let memory = arm_interface.memory_interface(&self.arm_memory_ap())?;
 
+        // Bound before the match, which borrows `specific_state` mutably.
+        let core_type = self.specific_state.core_type();
+
         Ok(match &mut self.specific_state {
             SpecificCoreState::Armv6m(s) => Core::new(
                 self.id,
                 name,
                 target,
-                crate::architecture::arm::armv6m::Armv6m::new(memory, s, debug_sequence)?,
+                crate::architecture::arm::armv6m::Armv6m::new(
+                    memory,
+                    s,
+                    debug_sequence,
+                    core_type,
+                )?,
             ),
             SpecificCoreState::Armv7a(s) => Core::new(
                 self.id,

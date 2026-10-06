@@ -1,24 +1,19 @@
 //! Register types and the core interface for armv6-M
 
 use super::{
-    CortexMState, Dfsr,
-    cortex_m::{enable_halting_debug, exit_halt, set_vector_catch},
-    registers::cortex_m::*,
+    CortexMState,
+    cortex_m::{CortexM, CortexMVariant},
+    registers::cortex_m::CORTEX_M_CORE_REGISTERS,
 };
 use crate::{
-    Architecture, BreakpointCause, CoreInformation, CoreInterface, CoreRegister, CoreStatus,
-    CoreType, HaltReason, InstructionSet, MemoryInterface, MemoryMappedRegister,
-    architecture::arm::{ArmError, memory::ArmMemoryInterface, sequences::ArmDebugSequence},
-    core::{CoreRegisters, RegisterId, RegisterValue, VectorCatchCondition},
+    MemoryMappedRegister,
+    architecture::arm::{ArmError, memory::ArmMemoryInterface},
+    core::CoreRegisters,
     error::Error,
-    memory::{CoreMemoryInterface, valid_32bit_address},
+    memory::valid_32bit_address,
 };
 use bitfield::bitfield;
-use std::{
-    mem::size_of,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::mem::size_of;
 
 bitfield! {
     /// Debug Halting Control and Status Register, DHCSR (see armv6-M Architecture Reference Manual C1.6.3)
@@ -409,377 +404,38 @@ impl MemoryMappedRegister<u32> for Demcr {
     const NAME: &'static str = "DEMCR";
 }
 
-/// The state of a core that can be used to persist core state across calls to multiple different cores.
-pub(crate) struct Armv6m<'probe> {
-    memory: Box<dyn ArmMemoryInterface + 'probe>,
+/// The ARMv6-M core driver.
+pub(crate) type Armv6m<'probe> = CortexM<'probe, Armv6mVariant>;
 
-    state: &'probe mut CortexMState,
+/// ARMv6-M has no FPU, a fixed register set, and a BPU rather than an FPB.
+pub struct Armv6mVariant;
 
-    sequence: Arc<dyn ArmDebugSequence>,
-}
+impl CortexMVariant for Armv6mVariant {
+    const FP_REGISTER_COUNT: usize = 0;
 
-impl<'probe> Armv6m<'probe> {
-    pub(crate) fn new(
-        mut memory: Box<dyn ArmMemoryInterface + 'probe>,
-        state: &'probe mut CortexMState,
-        sequence: Arc<dyn ArmDebugSequence>,
-    ) -> Result<Self, ArmError> {
-        if !state.initialized() {
-            // determine current state
-            let dhcsr = Dhcsr(memory.read_word_32(Dhcsr::get_mmio_address())?);
-
-            let core_state = if dhcsr.s_sleep() {
-                CoreStatus::Sleeping
-            } else if dhcsr.s_halt() {
-                let dfsr = Dfsr(memory.read_word_32(Dfsr::get_mmio_address())?);
-
-                let reason = dfsr.halt_reason();
-
-                tracing::debug!("Core was halted when connecting, reason: {:?}", reason);
-
-                CoreStatus::Halted(reason)
-            } else {
-                CoreStatus::Running
-            };
-
-            // Clear DFSR register. The bits in the register are sticky,
-            // so we clear them here to ensure that that none are set.
-            let dfsr_clear = Dfsr::clear_all();
-
-            memory.write_word_32(Dfsr::get_mmio_address(), dfsr_clear.into())?;
-
-            state.current_state = core_state;
-            state.initialize();
-        }
-
-        Ok(Self {
-            memory,
-            state,
-            sequence,
-        })
+    fn new(_memory: &mut dyn ArmMemoryInterface) -> Result<Self, Error> {
+        Ok(Self)
     }
 
-    fn set_core_status(&mut self, new_status: CoreStatus) {
-        super::update_core_status(&mut self.memory, &mut self.state.current_state, new_status);
+    fn registers(&self, _state: &CortexMState) -> &'static CoreRegisters {
+        &CORTEX_M_CORE_REGISTERS
     }
 
-    fn wait_for_status(
-        &mut self,
-        timeout: Duration,
-        predicate: impl Fn(CoreStatus) -> bool,
-    ) -> Result<(), Error> {
-        let start = Instant::now();
-
-        while !predicate(self.status()?) {
-            if start.elapsed() >= timeout {
-                return Err(Error::Arm(ArmError::Timeout));
-            }
-            // Wait a bit before polling again.
-            std::thread::sleep(Duration::from_millis(1));
-        }
-
-        Ok(())
-    }
-}
-
-impl CoreInterface for Armv6m<'_> {
-    fn wait_for_core_halted(&mut self, timeout: Duration) -> Result<(), Error> {
-        // Wait until halted state is active again.
-        self.wait_for_status(timeout, |s| s.is_halted())
-    }
-
-    fn core_halted(&mut self) -> Result<bool, Error> {
-        // Wait until halted state is active again.
-        //
-        // By calling the status function, the cached
-        // status is properly updated.
-        let status = self.status()?;
-
-        Ok(status.is_halted())
-    }
-
-    fn status(&mut self) -> Result<CoreStatus, Error> {
-        let dhcsr = Dhcsr(self.memory.read_word_32(Dhcsr::get_mmio_address())?);
-
-        if dhcsr.s_lockup() {
-            tracing::debug!(
-                "The core is in locked up status as a result of an unrecoverable exception"
-            );
-
-            self.state.clear_pending_step();
-            self.set_core_status(CoreStatus::LockedUp);
-            return Ok(CoreStatus::LockedUp);
-        }
-
-        if dhcsr.s_sleep() {
-            // Check if we assumed the core to be halted
-            if self.state.current_state.is_halted() {
-                tracing::warn!("Expected core to be halted, but core is running");
-            }
-
-            self.set_core_status(CoreStatus::Sleeping);
-            return Ok(CoreStatus::Sleeping);
-        }
-
-        // TODO: Handle lockup
-
-        if dhcsr.s_halt() {
-            let dfsr = Dfsr(self.memory.read_word_32(Dfsr::get_mmio_address())?);
-
-            let mut reason = dfsr.halt_reason();
-            reason = self.state.resolve_halt_reason(reason);
-
-            // Clear bits from Dfsr register
-            self.memory
-                .write_word_32(Dfsr::get_mmio_address(), Dfsr::clear_all().into())?;
-
-            // If the core was halted before, we cannot read the halt reason from the chip,
-            // because we clear it directly after reading.
-            if self.state.current_state.is_halted() {
-                // There shouldn't be any bits set, otherwise it means
-                // that the reason for the halt has changed. No bits set
-                // means that we have an unknown HaltReason.
-                if reason == HaltReason::Unknown {
-                    tracing::debug!("Cached halt reason: {:?}", self.state.current_state);
-                    return Ok(self.state.current_state);
-                }
-
-                tracing::debug!(
-                    "Reason for halt has changed, old reason was {:?}, new reason is {:?}",
-                    &self.state.current_state,
-                    &reason
-                );
-            }
-
-            // Set the status so any semihosting operations will know we're halted
-            self.set_core_status(CoreStatus::Halted(reason));
-
-            if let HaltReason::Breakpoint(_) = reason {
-                self.state.semihosting_command = super::cortex_m::check_for_semihosting(
-                    self.state.semihosting_command.take(),
-                    self,
-                )?;
-                if let Some(command) = self.state.semihosting_command {
-                    reason = HaltReason::Breakpoint(BreakpointCause::Semihosting(command));
-                }
-
-                // Set it again if it's changed
-                self.set_core_status(CoreStatus::Halted(reason));
-            }
-
-            return Ok(CoreStatus::Halted(reason));
-        }
-
-        // Core is neither halted nor sleeping, so we assume it is running.
-        if self.state.current_state.is_halted() {
-            tracing::warn!("Core is running, but we expected it to be halted");
-        }
-
-        self.set_core_status(CoreStatus::Running);
-
-        Ok(CoreStatus::Running)
-    }
-
-    fn halt(&mut self, timeout: Duration) -> Result<CoreInformation, Error> {
-        // TODO: Generic halt support
-        self.state.clear_pending_step();
-        self.state.pc_written = false;
-
-        let mut value = Dhcsr(0);
-        value.set_c_halt(true);
-        value.set_c_debugen(true);
-        value.enable_write();
-
-        self.memory
-            .write_word_32(Dhcsr::get_mmio_address(), value.into())?;
-
-        self.wait_for_core_halted(timeout)?;
-
-        // try to read the program counter
-        let pc_value = self.read_core_reg(self.program_counter().into())?;
-
-        // get pc
-        Ok(CoreInformation {
-            pc: pc_value.try_into()?,
-        })
-    }
-
-    fn run(&mut self) -> Result<(), Error> {
-        // Before we run, we always perform a single instruction step, to account for possible
-        // breakpoints that might get us stuck on the current instruction. If the PC was written
-        // since we halted, the core is no longer on that instruction and there is nothing to
-        // step over.
-        if !self.state.pc_written {
-            self.step()?;
-            self.state.clear_pending_step();
-        }
-        self.state.pc_written = false;
-
-        exit_halt(&mut *self.memory, false)?;
-
-        // We assume that the core is running now.
-        self.set_core_status(CoreStatus::Running);
-        Ok(())
-    }
-
-    fn reset(&mut self) -> Result<(), Error> {
-        self.state.semihosting_command = None;
-        self.state.clear_pending_step();
-        self.state.pc_written = false;
-
-        self.sequence
-            .reset_system(&mut *self.memory, crate::CoreType::Armv6m, None)?;
-        // Invalidate cached state: chip reset clears FP_CTRL and core status
-        self.set_core_status(CoreStatus::Unknown);
-        self.state.hw_breakpoints_enabled = false;
-        Ok(())
-    }
-
-    fn reset_and_halt(&mut self, _timeout: Duration) -> Result<CoreInformation, Error> {
-        self.reset_catch_set()?;
-        self.state.clear_pending_step();
-        self.state.pc_written = false;
-
-        self.sequence
-            .reset_system(&mut *self.memory, crate::CoreType::Armv6m, None)?;
-
-        // Invalidate cached state: chip reset clears FP_CTRL and core status
-        self.set_core_status(CoreStatus::Unknown);
-        self.state.hw_breakpoints_enabled = false;
-
-        // Some processors may not enter the halt state immediately after clearing the reset state.
-        // Particularly: on PSOC 6, vector catch takes effect after the core's boot ROM finishes
-        // executing, when jumping to the reset vector of the user application.
-        match self.wait_for_core_halted(Duration::from_millis(100)) {
-            Ok(()) => (),
-            Err(Error::Arm(ArmError::Timeout)) if self.status()? == CoreStatus::Sleeping => {
-                // On PSOC 6, if no application is loaded in flash, or if this core is waiting for
-                // another core to boot it, the boot ROM sleeps and vector catch is not triggered.
-                tracing::warn!(
-                    "reset_and_halt timed out and core is sleeping; assuming core is quiescent"
-                );
-                self.halt(Duration::from_millis(100))?;
-            }
-            Err(e) => return Err(e),
-        }
-
-        const XPSR_THUMB: u32 = 1 << 24;
-
-        let xpsr_value: u32 = self.read_core_reg(XPSR.id())?.try_into()?;
-        if xpsr_value & XPSR_THUMB == 0 {
-            self.write_core_reg(XPSR.id(), (xpsr_value | XPSR_THUMB).into())?;
-        }
-
-        self.reset_catch_clear()?;
-
-        // try to read the program counter
-        let pc_value = self.read_core_reg(self.program_counter().into())?;
-
-        // get pc
-        Ok(CoreInformation {
-            pc: pc_value.try_into()?,
-        })
-    }
-
-    fn step(&mut self) -> Result<CoreInformation, Error> {
-        // First check if we stopped on a breakpoint, because this requires special handling before we can continue.
-        let breakpoint_at_pc = if matches!(
-            self.state.current_state,
-            CoreStatus::Halted(HaltReason::Breakpoint(_))
-        ) {
-            let pc_before_step = self.read_core_reg(self.program_counter().into())?;
-            self.enable_breakpoints(false)?;
-            Some(pc_before_step)
-        } else {
-            None
-        };
-
-        // Only arm the pending step once the write has landed.
-        exit_halt(&mut *self.memory, true)?;
-        self.state.begin_step();
-
-        // The single-step might put the core in lockup state. Lockup isn't considered "halted"
-        // so we can't use `wait_for_core_halted` here.
-        // So we wait for halted OR lockup, and if we entered lockup we halt.
-        if let Err(err) = self.wait_for_status(Duration::from_millis(100), |s| {
-            matches!(s, CoreStatus::Halted(_) | CoreStatus::LockedUp)
-        }) {
-            self.state.clear_pending_step();
-            return Err(err);
-        }
-        if self.status()? == CoreStatus::LockedUp {
-            self.halt(Duration::from_millis(100))?;
-        }
-
-        // Try to read the new program counter.
-        let mut pc_after_step = self.read_core_reg(self.program_counter().into())?;
-
-        // Re-enable breakpoints before we continue.
-        if let Some(pc_before_step) = breakpoint_at_pc {
-            // If we were stopped on a software breakpoint, then we need to manually advance the PC, or else we will be stuck here forever.
-            if pc_before_step == pc_after_step
-                && !self
-                    .hw_breakpoints()?
-                    .contains(&pc_before_step.try_into().ok())
-            {
-                tracing::debug!(
-                    "Encountered a breakpoint instruction @ {}. We need to manually advance the program counter to the next instruction.",
-                    pc_after_step
-                );
-                // Advance the program counter by the architecture specific byte size of the BKPT instruction.
-                pc_after_step.increment_address(2)?;
-                self.write_core_reg(self.program_counter().into(), pc_after_step)?;
-            }
-            self.enable_breakpoints(true)?;
-        }
-
-        self.state.semihosting_command = None;
-
-        // The core halted again, and any PC write above was this function's own doing.
-        self.state.pc_written = false;
-
-        Ok(CoreInformation {
-            pc: pc_after_step.try_into()?,
-        })
-    }
-
-    fn read_core_reg(&mut self, address: RegisterId) -> Result<RegisterValue, Error> {
-        if self.state.current_state.is_halted() {
-            let val = super::cortex_m::read_core_reg(&mut *self.memory, address)?;
-            Ok(val.into())
-        } else {
-            Err(Error::Arm(ArmError::CoreNotHalted))
-        }
-    }
-
-    fn write_core_reg(&mut self, address: RegisterId, value: RegisterValue) -> Result<(), Error> {
-        if self.state.current_state.is_halted() {
-            super::cortex_m::write_core_reg(&mut *self.memory, address, value.try_into()?)?;
-            if address == self.program_counter().id() {
-                self.state.pc_written = true;
-            }
-            Ok(())
-        } else {
-            Err(Error::Arm(ArmError::CoreNotHalted))
-        }
-    }
-
-    fn available_breakpoint_units(&mut self) -> Result<u32, Error> {
-        let result = self.memory.read_word_32(BpCtrl::get_mmio_address())?;
+    fn available_breakpoint_units(memory: &mut dyn ArmMemoryInterface) -> Result<u32, Error> {
+        let result = memory.read_word_32(BpCtrl::get_mmio_address())?;
 
         let register = BpCtrl::from(result);
 
         Ok(register.num_code())
     }
 
-    /// See docs on the [`CoreInterface::hw_breakpoints`] trait
-    fn hw_breakpoints(&mut self) -> Result<Vec<Option<u64>>, Error> {
+    fn hw_breakpoints(memory: &mut dyn ArmMemoryInterface) -> Result<Vec<Option<u64>>, Error> {
         let mut breakpoints = vec![];
-        let num_hw_breakpoints = self.available_breakpoint_units()? as usize;
+        let num_hw_breakpoints = Self::available_breakpoint_units(memory)? as usize;
         for bp_unit_index in 0..num_hw_breakpoints {
             let reg_addr = BpCompx::get_mmio_address() + (bp_unit_index * size_of::<u32>()) as u64;
             // The raw breakpoint address as read from memory
-            let register_value = self.memory.read_word_32(reg_addr)?;
+            let register_value = memory.read_word_32(reg_addr)?;
             if BpCompx::from(register_value).enable() {
                 let breakpoint = BpCompx::get_breakpoint_comparator(register_value)?;
                 breakpoints.push(Some(breakpoint as u64));
@@ -790,22 +446,23 @@ impl CoreInterface for Armv6m<'_> {
         Ok(breakpoints)
     }
 
-    fn enable_breakpoints(&mut self, state: bool) -> Result<(), Error> {
-        tracing::debug!("Enabling breakpoints: {:?}", state);
+    fn enable_breakpoints(memory: &mut dyn ArmMemoryInterface, enabled: bool) -> Result<(), Error> {
+        tracing::debug!("Enabling breakpoints: {:?}", enabled);
         let mut value = BpCtrl(0);
         value.set_key(true);
-        value.set_enable(state);
+        value.set_enable(enabled);
 
-        self.memory
-            .write_word_32(BpCtrl::get_mmio_address(), value.into())?;
-        self.memory.flush()?;
-
-        self.state.hw_breakpoints_enabled = state;
+        memory.write_word_32(BpCtrl::get_mmio_address(), value.into())?;
+        memory.flush()?;
 
         Ok(())
     }
 
-    fn set_hw_breakpoint(&mut self, bp_register_index: usize, addr: u64) -> Result<(), Error> {
+    fn set_hw_breakpoint(
+        memory: &mut dyn ArmMemoryInterface,
+        index: usize,
+        addr: u64,
+    ) -> Result<(), Error> {
         let addr = valid_32bit_address(addr)?;
 
         tracing::debug!("Setting breakpoint on address 0x{:08x}", addr);
@@ -829,112 +486,21 @@ impl CoreInterface for Armv6m<'_> {
         value.set_comp((addr >> 2) & 0x07FF_FFFF);
         value.set_enable(true);
 
-        let register_addr =
-            BpCompx::get_mmio_address() + (bp_register_index * size_of::<u32>()) as u64;
+        let register_addr = BpCompx::get_mmio_address() + (index * size_of::<u32>()) as u64;
 
-        self.memory.write_word_32(register_addr, value.into())?;
+        memory.write_word_32(register_addr, value.into())?;
 
         Ok(())
     }
 
-    fn clear_hw_breakpoint(&mut self, bp_unit_index: usize) -> Result<(), Error> {
-        let register_addr = BpCompx::get_mmio_address() + (bp_unit_index * size_of::<u32>()) as u64;
+    fn clear_hw_breakpoint(memory: &mut dyn ArmMemoryInterface, index: usize) -> Result<(), Error> {
+        let register_addr = BpCompx::get_mmio_address() + (index * size_of::<u32>()) as u64;
 
         let mut value = BpCompx::from(0);
         value.set_enable(false);
 
-        self.memory.write_word_32(register_addr, value.into())?;
+        memory.write_word_32(register_addr, value.into())?;
 
         Ok(())
-    }
-
-    fn registers(&self) -> &'static CoreRegisters {
-        &CORTEX_M_CORE_REGISTERS
-    }
-
-    fn program_counter(&self) -> &'static CoreRegister {
-        &PC
-    }
-
-    fn frame_pointer(&self) -> &'static CoreRegister {
-        &FP
-    }
-
-    fn stack_pointer(&self) -> &'static CoreRegister {
-        &SP
-    }
-
-    fn return_address(&self) -> &'static CoreRegister {
-        &RA
-    }
-
-    fn hw_breakpoints_enabled(&self) -> bool {
-        self.state.hw_breakpoints_enabled
-    }
-
-    fn architecture(&self) -> Architecture {
-        Architecture::Arm
-    }
-
-    fn core_type(&self) -> CoreType {
-        CoreType::Armv6m
-    }
-
-    fn instruction_set(&mut self) -> Result<InstructionSet, Error> {
-        Ok(InstructionSet::Thumb2)
-    }
-
-    fn fpu_support(&mut self) -> Result<bool, Error> {
-        Ok(false)
-    }
-
-    fn floating_point_register_count(&mut self) -> Result<usize, Error> {
-        Ok(0)
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn reset_catch_set(&mut self) -> Result<(), Error> {
-        // Set the reset_catch bit.
-
-        self.sequence
-            .reset_catch_set(&mut *self.memory, CoreType::Armv6m, None)?;
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn reset_catch_clear(&mut self) -> Result<(), Error> {
-        self.sequence
-            .reset_catch_clear(&mut *self.memory, CoreType::Armv6m, None)?;
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn debug_core_stop(&mut self) -> Result<(), Error> {
-        self.sequence
-            .debug_core_stop(&mut *self.memory, CoreType::Armv6m)?;
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn enable_vector_catch(&mut self, condition: VectorCatchCondition) -> Result<(), Error> {
-        enable_halting_debug(&mut *self.memory)?;
-        set_vector_catch(&mut *self.memory, condition, true)
-    }
-
-    fn disable_vector_catch(&mut self, condition: VectorCatchCondition) -> Result<(), Error> {
-        set_vector_catch(&mut *self.memory, condition, false)
-    }
-}
-
-impl CoreMemoryInterface for Armv6m<'_> {
-    type ErrorType = ArmError;
-
-    fn memory(&self) -> &dyn MemoryInterface<Self::ErrorType> {
-        self.memory.as_ref()
-    }
-    fn memory_mut(&mut self) -> &mut dyn MemoryInterface<Self::ErrorType> {
-        self.memory.as_mut()
     }
 }
