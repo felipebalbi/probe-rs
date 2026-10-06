@@ -125,7 +125,7 @@ impl CoreInterface for Armv8m<'_> {
         Ok(self.status()?.is_halted())
     }
 
-    fn status(&mut self) -> Result<crate::core::CoreStatus, Error> {
+    fn status(&mut self) -> Result<CoreStatus, Error> {
         let dhcsr = Dhcsr(self.memory.read_word_32(Dhcsr::get_mmio_address())?);
 
         if dhcsr.s_lockup() {
