@@ -147,7 +147,12 @@ impl CombinedCoreState {
                 self.id,
                 name,
                 target,
-                crate::architecture::arm::armv8m::Armv8m::new(memory, s, debug_sequence)?,
+                crate::architecture::arm::armv8m::Armv8m::new(
+                    memory,
+                    s,
+                    debug_sequence,
+                    core_type,
+                )?,
             ),
             _ => {
                 unreachable!(
