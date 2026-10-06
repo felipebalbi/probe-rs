@@ -223,9 +223,6 @@ impl CoreInterface for Armv8m<'_> {
 
         self.wait_for_core_halted(timeout)?;
 
-        // Update core status
-        let _ = self.status()?;
-
         // try to read the program counter
         let pc_value = self.read_core_reg(self.program_counter().into())?;
 
