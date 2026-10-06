@@ -124,7 +124,12 @@ impl CombinedCoreState {
                 self.id,
                 name,
                 target,
-                crate::architecture::arm::armv7m::Armv7m::new(memory, s, debug_sequence)?,
+                crate::architecture::arm::armv7m::Armv7m::new(
+                    memory,
+                    s,
+                    debug_sequence,
+                    core_type,
+                )?,
             ),
             SpecificCoreState::Armv8a(s) => Core::new(
                 self.id,
