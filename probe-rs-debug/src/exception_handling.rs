@@ -17,7 +17,7 @@ pub(crate) mod armv6m;
 /// Where applicable, this defines shared logic for implementing exception handling across the various ARMv6-m and
 /// ARMv7-m [`crate::CoreType`]'s.
 pub(crate) mod armv6m_armv7m_shared;
-// NOTE: There is also a [`CoreType::Armv7em`] variant, but it is not currently used/implemented in probe-rs.
+// CoreType::Armv7em shares the ARMv7-M exception model, see exception_handler_for_core below.
 pub(crate) mod armv7m;
 pub(crate) mod armv8m;
 pub(crate) mod riscv;

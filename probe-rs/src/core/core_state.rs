@@ -363,7 +363,7 @@ impl SpecificCoreState {
             CoreType::Armv7a => SpecificCoreState::Armv7a(CortexARState::new()),
             CoreType::Armv7r => SpecificCoreState::Armv7r(CortexARState::new()),
             CoreType::Armv7m => SpecificCoreState::Armv7m(CortexMState::new()),
-            CoreType::Armv7em => SpecificCoreState::Armv7m(CortexMState::new()),
+            CoreType::Armv7em => SpecificCoreState::Armv7em(CortexMState::new()),
             CoreType::Armv8a => SpecificCoreState::Armv8a(CortexARState::new()),
             CoreType::Armv8m => SpecificCoreState::Armv8m(CortexMState::new()),
             CoreType::Riscv => SpecificCoreState::Riscv(RiscvCoreState::new()),
